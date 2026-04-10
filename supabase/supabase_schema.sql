@@ -1,0 +1,615 @@
+-- ============================================================
+--  ContinuumCare — Supabase Database Schema
+--  Run this entire file in your Supabase SQL Editor
+--  Project Settings → SQL Editor → New Query → Paste → Run
+-- ============================================================
+
+-- ============================================================
+--  CLEANUP / WIPE EVERYTHING
+-- ============================================================
+DROP TABLE IF EXISTS public.lab_reports CASCADE;
+DROP TABLE IF EXISTS public.diagnostic_bookings CASCADE;
+DROP TABLE IF EXISTS public.medications CASCADE;
+DROP TABLE IF EXISTS public.prescriptions CASCADE;
+DROP TABLE IF EXISTS public.alerts CASCADE;
+DROP TABLE IF EXISTS public.visits CASCADE;
+DROP TABLE IF EXISTS public.patient_assignments CASCADE;
+DROP TABLE IF EXISTS public.patients CASCADE;
+DROP TABLE IF EXISTS public.profiles CASCADE;
+
+DROP FUNCTION IF EXISTS public.handle_new_user() CASCADE;
+DROP FUNCTION IF EXISTS public.generate_visit_alerts() CASCADE;
+DROP FUNCTION IF EXISTS public.set_updated_at() CASCADE;
+
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users CASCADE;
+
+DROP POLICY IF EXISTS "storage_upload_authenticated" ON storage.objects;
+DROP POLICY IF EXISTS "storage_read_authenticated" ON storage.objects;
+
+-- Enable UUID extension (enabled by default in Supabase)
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- ============================================================
+--  TABLE: profiles
+--  Extends auth.users with app-specific fields and roles.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS public.profiles (
+  id          UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  full_name   TEXT NOT NULL,
+  role        TEXT NOT NULL CHECK (role IN ('doctor', 'nurse', 'family')),
+  phone       TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE public.profiles IS 'User profiles extending auth.users with name, role, and contact info.';
+
+-- ============================================================
+--  TABLE: patients
+--  Core patient demographic and medical records.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS public.patients (
+  id                        UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  full_name                 TEXT NOT NULL,
+  date_of_birth             DATE,
+  gender                    TEXT CHECK (gender IN ('male', 'female', 'other')),
+  phone                     TEXT,
+  address                   TEXT,
+  emergency_contact_name    TEXT,
+  emergency_contact_phone   TEXT,
+  medical_history           TEXT,
+  allergies                 TEXT,
+  consent_data_sharing      BOOLEAN NOT NULL DEFAULT FALSE,
+  created_by                UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+  created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at                TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE public.patients IS 'Patient demographics, medical history, and consent information.';
+
+-- ============================================================
+--  TABLE: patient_assignments
+--  Maps caregivers (profiles) to patients they are responsible for.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS public.patient_assignments (
+  id           UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  patient_id   UUID NOT NULL REFERENCES public.patients(id) ON DELETE CASCADE,
+  profile_id   UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  relationship TEXT NOT NULL DEFAULT 'assigned' CHECK (
+    relationship IN ('primary_doctor', 'primary_nurse', 'assigned', 'family_member')
+  ),
+  assigned_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (patient_id, profile_id)
+);
+
+COMMENT ON TABLE public.patient_assignments IS 'Caregivers and family members assigned to specific patients.';
+
+-- ============================================================
+--  TABLE: visits
+--  Clinical visit logs with vital signs recorded per visit.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS public.visits (
+  id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  patient_id    UUID NOT NULL REFERENCES public.patients(id) ON DELETE CASCADE,
+  logged_by     UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+  visited_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  -- Vitals
+  systolic_bp   NUMERIC(5,1),
+  diastolic_bp  NUMERIC(5,1),
+  temperature_f NUMERIC(5,1),
+  spo2          NUMERIC(5,1),
+  heart_rate    NUMERIC(5,0),
+  weight_kg     NUMERIC(6,2),
+  -- Clinical notes
+  notes         TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE public.visits IS 'Patient visit records including vital signs and clinical notes.';
+
+-- ============================================================
+--  TABLE: alerts
+--  Health alerts auto-generated by visit triggers or manually.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS public.alerts (
+  id                    UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  patient_id            UUID NOT NULL REFERENCES public.patients(id) ON DELETE CASCADE,
+  visit_id              UUID REFERENCES public.visits(id) ON DELETE SET NULL,
+  alert_type            TEXT NOT NULL,
+  severity              TEXT NOT NULL CHECK (severity IN ('critical', 'medium', 'low')),
+  message               TEXT NOT NULL,
+  status                TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'acknowledged', 'resolved')),
+  acknowledged_by       UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+  acknowledged_at       TIMESTAMPTZ,
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE public.alerts IS 'Health alerts generated from abnormal vitals or manual clinical judgment.';
+
+-- ============================================================
+--  TABLE: prescriptions
+--  Doctor-issued prescriptions linking to medications.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS public.prescriptions (
+  id               UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  patient_id       UUID NOT NULL REFERENCES public.patients(id) ON DELETE CASCADE,
+  prescribed_by    UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+  diagnosis        TEXT,
+  notes            TEXT,
+  file_url         TEXT,
+  prescribed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE public.prescriptions IS 'Prescription records issued by doctors for patients.';
+
+-- ============================================================
+--  TABLE: medications
+--  Individual medications belonging to a prescription.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS public.medications (
+  id                   UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  prescription_id      UUID NOT NULL REFERENCES public.prescriptions(id) ON DELETE CASCADE,
+  name                 TEXT NOT NULL,
+  dosage               TEXT,
+  frequency            TEXT,
+  duration             TEXT,
+  generic_alternative  TEXT,
+  generic_composition  TEXT,
+  generic_price        NUMERIC(10,2),
+  brand_price          NUMERIC(10,2),
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE public.medications IS 'Individual drug entries linked to a prescription.';
+
+-- ============================================================
+--  TABLE: diagnostic_bookings
+--  Lab/diagnostic test bookings for patients.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS public.diagnostic_bookings (
+  id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  patient_id    UUID NOT NULL REFERENCES public.patients(id) ON DELETE CASCADE,
+  booked_by     UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+  test_name     TEXT NOT NULL,
+  lab_name      TEXT,
+  lab_address   TEXT,
+  scheduled_at  TIMESTAMPTZ,
+  status        TEXT NOT NULL DEFAULT 'booked' CHECK (status IN ('booked', 'completed', 'cancelled')),
+  notes         TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE public.diagnostic_bookings IS 'Scheduled diagnostic test bookings at labs for patients.';
+
+-- ============================================================
+--  TABLE: lab_reports
+--  Uploaded diagnostic report files linked to patients.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS public.lab_reports (
+  id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  patient_id    UUID NOT NULL REFERENCES public.patients(id) ON DELETE CASCADE,
+  uploaded_by   UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+  file_url      TEXT NOT NULL,
+  file_name     TEXT NOT NULL,
+  report_type   TEXT NOT NULL DEFAULT 'general',
+  notes         TEXT,
+  report_date   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE public.lab_reports IS 'Uploaded diagnostic/lab report files associated with patients.';
+
+-- ============================================================
+--  INDEXES — Improve query performance on common lookups
+-- ============================================================
+CREATE INDEX IF NOT EXISTS idx_patient_assignments_patient  ON public.patient_assignments(patient_id);
+CREATE INDEX IF NOT EXISTS idx_patient_assignments_profile  ON public.patient_assignments(profile_id);
+CREATE INDEX IF NOT EXISTS idx_visits_patient               ON public.visits(patient_id);
+CREATE INDEX IF NOT EXISTS idx_visits_visited_at            ON public.visits(visited_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_patient               ON public.alerts(patient_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_status                ON public.alerts(status);
+CREATE INDEX IF NOT EXISTS idx_alerts_created_at            ON public.alerts(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_prescriptions_patient        ON public.prescriptions(patient_id);
+CREATE INDEX IF NOT EXISTS idx_medications_prescription     ON public.medications(prescription_id);
+CREATE INDEX IF NOT EXISTS idx_diagnostic_patient           ON public.diagnostic_bookings(patient_id);
+CREATE INDEX IF NOT EXISTS idx_lab_reports_patient          ON public.lab_reports(patient_id);
+
+-- ============================================================
+--  TRIGGERS: Auto-update updated_at timestamps
+-- ============================================================
+CREATE OR REPLACE FUNCTION public.set_updated_at()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trigger_profiles_updated_at
+  BEFORE UPDATE ON public.profiles
+  FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+CREATE TRIGGER trigger_patients_updated_at
+  BEFORE UPDATE ON public.patients
+  FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+-- ============================================================
+--  TRIGGER: Auto-create profile from auth.users on signup
+--  Reads metadata set during signUp() call in AuthContext.
+-- ============================================================
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+  INSERT INTO public.profiles (id, full_name, role, phone)
+  VALUES (
+    NEW.id,
+    COALESCE(NEW.raw_user_meta_data->>'full_name', split_part(NEW.email, '@', 1)),
+    COALESCE(NEW.raw_user_meta_data->>'role', 'nurse'),
+    NEW.raw_user_meta_data->>'phone'
+  )
+  ON CONFLICT (id) DO NOTHING;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
+-- ============================================================
+--  TRIGGER: Auto-generate alerts on abnormal vitals (visit insert)
+--  Mirrors the threshold logic in src/utils/vitalsAnalysis.js
+-- ============================================================
+CREATE OR REPLACE FUNCTION public.generate_visit_alerts()
+RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE
+  v_alert_type TEXT;
+  v_severity   TEXT;
+  v_message    TEXT;
+BEGIN
+  -- SpO₂ checks
+  IF NEW.spo2 IS NOT NULL THEN
+    IF NEW.spo2 < 92 THEN
+      INSERT INTO public.alerts (patient_id, visit_id, alert_type, severity, message)
+      VALUES (NEW.patient_id, NEW.id, 'low_spo2', 'critical',
+        format('Critical: SpO₂ is %s%% (below 92%%). Immediate assessment may be required.', NEW.spo2));
+    ELSIF NEW.spo2 < 95 THEN
+      INSERT INTO public.alerts (patient_id, visit_id, alert_type, severity, message)
+      VALUES (NEW.patient_id, NEW.id, 'low_spo2', 'medium',
+        format('Warning: SpO₂ is %s%% (below 95%%). Monitor closely.', NEW.spo2));
+    END IF;
+  END IF;
+
+  -- Temperature checks
+  IF NEW.temperature_f IS NOT NULL THEN
+    IF NEW.temperature_f > 103 THEN
+      INSERT INTO public.alerts (patient_id, visit_id, alert_type, severity, message)
+      VALUES (NEW.patient_id, NEW.id, 'high_temperature', 'critical',
+        format('Critical: Temperature is %s°F (above 103°F). High fever — urgent review needed.', NEW.temperature_f));
+    ELSIF NEW.temperature_f > 101 THEN
+      INSERT INTO public.alerts (patient_id, visit_id, alert_type, severity, message)
+      VALUES (NEW.patient_id, NEW.id, 'high_temperature', 'medium',
+        format('Warning: Temperature is %s°F (above 101°F). Fever present.', NEW.temperature_f));
+    END IF;
+  END IF;
+
+  -- Systolic BP checks
+  IF NEW.systolic_bp IS NOT NULL THEN
+    IF NEW.systolic_bp > 180 OR NEW.systolic_bp < 80 THEN
+      INSERT INTO public.alerts (patient_id, visit_id, alert_type, severity, message)
+      VALUES (NEW.patient_id, NEW.id, 'abnormal_bp', 'critical',
+        format('Critical: Systolic BP is %s mmHg. Dangerously abnormal blood pressure.', NEW.systolic_bp));
+    ELSIF NEW.systolic_bp > 140 OR NEW.systolic_bp < 90 THEN
+      INSERT INTO public.alerts (patient_id, visit_id, alert_type, severity, message)
+      VALUES (NEW.patient_id, NEW.id, 'abnormal_bp', 'medium',
+        format('Warning: Systolic BP is %s mmHg. Outside normal range.', NEW.systolic_bp));
+    END IF;
+  END IF;
+
+  -- Diastolic BP checks
+  IF NEW.diastolic_bp IS NOT NULL THEN
+    IF NEW.diastolic_bp > 120 OR NEW.diastolic_bp < 50 THEN
+      INSERT INTO public.alerts (patient_id, visit_id, alert_type, severity, message)
+      VALUES (NEW.patient_id, NEW.id, 'abnormal_bp', 'critical',
+        format('Critical: Diastolic BP is %s mmHg. Dangerously abnormal.', NEW.diastolic_bp));
+    ELSIF NEW.diastolic_bp > 90 OR NEW.diastolic_bp < 60 THEN
+      INSERT INTO public.alerts (patient_id, visit_id, alert_type, severity, message)
+      VALUES (NEW.patient_id, NEW.id, 'abnormal_bp', 'medium',
+        format('Warning: Diastolic BP is %s mmHg. Outside normal range.', NEW.diastolic_bp));
+    END IF;
+  END IF;
+
+  -- Heart rate checks
+  IF NEW.heart_rate IS NOT NULL THEN
+    IF NEW.heart_rate > 130 OR NEW.heart_rate < 45 THEN
+      INSERT INTO public.alerts (patient_id, visit_id, alert_type, severity, message)
+      VALUES (NEW.patient_id, NEW.id, 'abnormal_heart_rate', 'critical',
+        format('Critical: Heart rate is %s bpm. Severely abnormal — review urgently.', NEW.heart_rate));
+    ELSIF NEW.heart_rate > 120 OR NEW.heart_rate < 50 THEN
+      INSERT INTO public.alerts (patient_id, visit_id, alert_type, severity, message)
+      VALUES (NEW.patient_id, NEW.id, 'abnormal_heart_rate', 'medium',
+        format('Warning: Heart rate is %s bpm. Outside normal range.', NEW.heart_rate));
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS on_visit_inserted ON public.visits;
+CREATE TRIGGER on_visit_inserted
+  AFTER INSERT ON public.visits
+  FOR EACH ROW EXECUTE FUNCTION public.generate_visit_alerts();
+
+-- ============================================================
+--  ROW LEVEL SECURITY (RLS)
+--  Enforces access control at the database level.
+-- ============================================================
+
+-- Enable RLS on all tables
+ALTER TABLE public.profiles           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.patients           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.patient_assignments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.visits             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.alerts             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.prescriptions      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.medications        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.diagnostic_bookings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.lab_reports        ENABLE ROW LEVEL SECURITY;
+
+-- ─── PROFILES ─────────────────────────────────────────────
+-- Users can read all profiles (needed to show team member names)
+-- Users can only update their own profile
+CREATE POLICY "profiles_select_all" ON public.profiles
+  FOR SELECT USING (auth.role() = 'authenticated');
+
+CREATE POLICY "profiles_insert_own" ON public.profiles
+  FOR INSERT WITH CHECK (auth.uid() = id);
+
+CREATE POLICY "profiles_update_own" ON public.profiles
+  FOR UPDATE USING (auth.uid() = id);
+
+-- ─── PATIENTS ─────────────────────────────────────────────
+-- Doctors and nurses can see all patients
+-- Family members can only see patients they are assigned to
+CREATE POLICY "patients_select_staff" ON public.patients
+  FOR SELECT USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles p
+      WHERE p.id = auth.uid() AND p.role IN ('doctor', 'nurse')
+    )
+    OR
+    EXISTS (
+      SELECT 1 FROM public.patient_assignments pa
+      WHERE pa.patient_id = patients.id AND pa.profile_id = auth.uid()
+    )
+  );
+
+CREATE POLICY "patients_insert_staff" ON public.patients
+  FOR INSERT WITH CHECK (
+    EXISTS (
+      SELECT 1 FROM public.profiles p
+      WHERE p.id = auth.uid() AND p.role IN ('doctor', 'nurse')
+    )
+  );
+
+CREATE POLICY "patients_update_staff" ON public.patients
+  FOR UPDATE USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles p
+      WHERE p.id = auth.uid() AND p.role IN ('doctor', 'nurse')
+    )
+  );
+
+-- ─── ROLES OVERRIDE FUNCTION ────────────────────────────
+-- A security definer function to avoid RLS recursion when checking staff roles
+CREATE OR REPLACE FUNCTION public.is_staff()
+RETURNS boolean AS $$
+BEGIN
+  RETURN EXISTS (
+    SELECT 1 FROM public.profiles
+    WHERE id = auth.uid() AND role IN ('doctor', 'nurse')
+  );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- ─── PATIENT ASSIGNMENTS ──────────────────────────────────
+CREATE POLICY "assignments_select_all" ON public.patient_assignments
+  FOR SELECT USING (auth.uid() IS NOT NULL);
+
+CREATE POLICY "assignments_insert_staff" ON public.patient_assignments
+  FOR INSERT WITH CHECK (public.is_staff());
+
+CREATE POLICY "assignments_delete_staff" ON public.patient_assignments
+  FOR DELETE USING (public.is_staff());
+
+-- ─── VISITS ───────────────────────────────────────────────
+-- Anyone assigned to the patient can read visits
+CREATE POLICY "visits_select" ON public.visits
+  FOR SELECT USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles p
+      WHERE p.id = auth.uid() AND p.role IN ('doctor', 'nurse')
+    )
+    OR
+    EXISTS (
+      SELECT 1 FROM public.patient_assignments pa
+      WHERE pa.patient_id = visits.patient_id AND pa.profile_id = auth.uid()
+    )
+  );
+
+CREATE POLICY "visits_insert_staff" ON public.visits
+  FOR INSERT WITH CHECK (
+    EXISTS (
+      SELECT 1 FROM public.profiles p
+      WHERE p.id = auth.uid() AND p.role IN ('doctor', 'nurse')
+    )
+  );
+
+-- ─── ALERTS ───────────────────────────────────────────────
+CREATE POLICY "alerts_select" ON public.alerts
+  FOR SELECT USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles p
+      WHERE p.id = auth.uid() AND p.role IN ('doctor', 'nurse')
+    )
+    OR
+    EXISTS (
+      SELECT 1 FROM public.patient_assignments pa
+      WHERE pa.patient_id = alerts.patient_id AND pa.profile_id = auth.uid()
+    )
+  );
+
+CREATE POLICY "alerts_update_staff" ON public.alerts
+  FOR UPDATE USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles p
+      WHERE p.id = auth.uid() AND p.role IN ('doctor', 'nurse')
+    )
+  );
+
+-- Trigger function inserts alerts, needs SECURITY DEFINER — no RLS INSERT needed from client
+CREATE POLICY "alerts_insert_all" ON public.alerts
+  FOR INSERT WITH CHECK (auth.role() = 'authenticated');
+
+-- ─── PRESCRIPTIONS ────────────────────────────────────────
+CREATE POLICY "prescriptions_select" ON public.prescriptions
+  FOR SELECT USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles p
+      WHERE p.id = auth.uid() AND p.role IN ('doctor', 'nurse')
+    )
+    OR
+    EXISTS (
+      SELECT 1 FROM public.patient_assignments pa
+      WHERE pa.patient_id = prescriptions.patient_id AND pa.profile_id = auth.uid()
+    )
+  );
+
+CREATE POLICY "prescriptions_insert_doctor" ON public.prescriptions
+  FOR INSERT WITH CHECK (
+    EXISTS (
+      SELECT 1 FROM public.profiles p
+      WHERE p.id = auth.uid() AND p.role = 'doctor'
+    )
+  );
+
+-- ─── MEDICATIONS ──────────────────────────────────────────
+CREATE POLICY "medications_select" ON public.medications
+  FOR SELECT USING (auth.role() = 'authenticated');
+
+CREATE POLICY "medications_insert_doctor" ON public.medications
+  FOR INSERT WITH CHECK (
+    EXISTS (
+      SELECT 1 FROM public.profiles p
+      WHERE p.id = auth.uid() AND p.role = 'doctor'
+    )
+  );
+
+CREATE POLICY "medications_update_doctor" ON public.medications
+  FOR UPDATE USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles p
+      WHERE p.id = auth.uid() AND p.role = 'doctor'
+    )
+  );
+
+CREATE POLICY "medications_delete_doctor" ON public.medications
+  FOR DELETE USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles p
+      WHERE p.id = auth.uid() AND p.role = 'doctor'
+    )
+  );
+
+-- ─── DIAGNOSTIC BOOKINGS ──────────────────────────────────
+CREATE POLICY "diagnostics_select" ON public.diagnostic_bookings
+  FOR SELECT USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles p
+      WHERE p.id = auth.uid() AND p.role IN ('doctor', 'nurse')
+    )
+    OR
+    EXISTS (
+      SELECT 1 FROM public.patient_assignments pa
+      WHERE pa.patient_id = diagnostic_bookings.patient_id AND pa.profile_id = auth.uid()
+    )
+  );
+
+CREATE POLICY "diagnostics_insert_staff" ON public.diagnostic_bookings
+  FOR INSERT WITH CHECK (
+    EXISTS (
+      SELECT 1 FROM public.profiles p
+      WHERE p.id = auth.uid() AND p.role IN ('doctor', 'nurse')
+    )
+  );
+
+CREATE POLICY "diagnostics_update_staff" ON public.diagnostic_bookings
+  FOR UPDATE USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles p
+      WHERE p.id = auth.uid() AND p.role IN ('doctor', 'nurse')
+    )
+  );
+
+-- ─── LAB REPORTS ──────────────────────────────────────────
+CREATE POLICY "lab_reports_select" ON public.lab_reports
+  FOR SELECT USING (
+    public.is_staff()
+    OR
+    EXISTS (
+      SELECT 1 FROM public.patient_assignments pa
+      WHERE pa.patient_id = lab_reports.patient_id AND pa.profile_id = auth.uid()
+    )
+  );
+
+CREATE POLICY "lab_reports_insert_staff" ON public.lab_reports
+  FOR INSERT WITH CHECK (public.is_staff());
+
+-- ============================================================
+--  REALTIME: Enable realtime on key tables
+--  (so the Supabase JS client subscriptions work)
+-- ============================================================
+ALTER PUBLICATION supabase_realtime ADD TABLE public.alerts;
+ALTER PUBLICATION supabase_realtime ADD TABLE public.visits;
+
+-- ============================================================
+--  STORAGE: Create the lab-reports bucket
+--  Run this separately if the SQL editor doesn't support it,
+--  or create it manually in Storage → New Bucket.
+-- ============================================================
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('lab-reports', 'lab-reports', false)
+ON CONFLICT (id) DO NOTHING;
+
+-- Storage policy: authenticated users can upload to their own folder
+CREATE POLICY "storage_upload_authenticated" ON storage.objects
+  FOR INSERT WITH CHECK (
+    bucket_id = 'lab-reports' AND auth.uid() IS NOT NULL
+  );
+
+-- Storage policy: authenticated users can read their uploaded files
+CREATE POLICY "storage_read_authenticated" ON storage.objects
+  FOR SELECT USING (
+    bucket_id = 'lab-reports' AND auth.uid() IS NOT NULL
+  );
+
+-- ============================================================
+--  PERMISSIONS: Grant access to anon and authenticated roles
+-- ============================================================
+GRANT USAGE ON SCHEMA public TO anon, authenticated;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO anon, authenticated;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated;
+GRANT ALL PRIVILEGES ON ALL ROUTINES IN SCHEMA public TO anon, authenticated;
+
+-- ============================================================
+--  DONE!
+--  After running this schema:
+--  1. Copy your Supabase URL and anon key from Project Settings → API
+--  2. Create a .env file in the project root:
+--       VITE_SUPABASE_URL=https://xxxx.supabase.co
+--       VITE_SUPABASE_ANON_KEY=eyJ...
+--  3. Run: npm run dev
+-- ============================================================
